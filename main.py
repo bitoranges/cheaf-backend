@@ -69,7 +69,7 @@ def sign_request(method, path, query, headers, body, ak, sk):
     signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
     
     # 修复 BUG：这里之前写成了 signedHeaders，现在改为 signed_headers (与上面定义一致)
-    auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, signed_headers={signed_headers}, Signature={signature}"
     headers["Authorization"] = auth
     return headers
 
