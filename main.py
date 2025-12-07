@@ -9,13 +9,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# 1. 强制日志输出到控制台 (解决 Zeabur 看不到日志的问题)
 def log(msg):
     print(f"[Cheaf] {msg}", file=sys.stdout, flush=True)
 
 app = FastAPI()
 
-# 2. 允许跨域
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,8 +33,8 @@ class StatusRequest(BaseModel):
     access_key: str
     secret_key: str
 
-def sign_request(method, path, query, headers, body, ak, sk):
-    # 移除微秒，防止时间格式不匹配
+def sign_request(method, path, query, headers, body_bytes, ak, sk):
+    # body_bytes 必须是 bytes 类型，确保签名对象和发送对象完全一致
     now = datetime.datetime.utcnow().replace(microsecond=0)
     iso_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_short = now.strftime("%Y%m%d")
@@ -46,13 +44,14 @@ def sign_request(method, path, query, headers, body, ak, sk):
     
     canonical_uri = path
     canonical_query = "&".join([f"{k}={v}" for k, v in sorted(query.items())])
+    
+    # 排序 Header
     sorted_headers = sorted(headers.items())
     canonical_headers = "".join([f"{k.lower()}:{v.strip()}\n" for k, v in sorted_headers])
-    
-    # 变量定义为 signed_headers (下划线)
     signed_headers = ";".join([k.lower() for k, v in sorted_headers])
     
-    payload_hash = hashlib.sha256(body.encode('utf-8')).hexdigest()
+    # 计算 Payload Hash (直接对二进制数据哈希)
+    payload_hash = hashlib.sha256(body_bytes).hexdigest()
     
     canonical_request = f"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     
@@ -68,8 +67,7 @@ def sign_request(method, path, query, headers, body, ak, sk):
     k_signing = get_hmac(k_service, "request")
     signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
     
-    # 修复 BUG：这里之前写成了 signedHeaders，现在改为 signed_headers (与上面定义一致)
-    auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, signed_headers={signed_headers}, Signature={signature}"
+    auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
     headers["Authorization"] = auth
     return headers
 
@@ -80,7 +78,7 @@ def read_root():
 
 @app.post("/api/generate_video")
 def generate_video(req: VideoRequest):
-    log(f"New Task Prompt: {req.prompt[:30]}...")
+    log(f"New Task Prompt: {req.prompt[:20]}...")
     
     host = "visual.volcengineapi.com"
     path = "/"
@@ -92,30 +90,37 @@ def generate_video(req: VideoRequest):
         "ratio": req.ratio,
         "model_version": "general_v3"
     }
-    body_str = json.dumps(body_obj)
+    
+    # 关键修正：
+    # 1. ensure_ascii=False: 允许输出真实中文，不转义为 \uXXXX
+    # 2. separators=(',', ':'): 去除空格，紧凑格式，防止哈希不一致
+    # 3. .encode('utf-8'): 转为二进制 bytes，确保 requests 发送的和我们签名的是同一串字节
+    body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    
     headers = {"content-type": "application/json"}
     
     try:
         log("Signing request...")
-        signed_headers_dict = sign_request("POST", path, query, headers, body_str, req.access_key, req.secret_key)
+        signed_headers_dict = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
         
         log("Sending to Volcengine...")
-        resp = requests.post(url, headers=signed_headers_dict, data=body_str)
+        # 注意这里用 data=body_bytes
+        resp = requests.post(url, headers=signed_headers_dict, data=body_bytes)
         
         log(f"Volcengine Response: {resp.status_code}")
         
-        # 无论成功失败，尝试解析 JSON 返回给前端，让前端展示具体错误
+        if resp.status_code != 200:
+             log(f"Error Body: {resp.text}")
+
         try:
             return resp.json()
         except:
-            log(f"Non-JSON Response: {resp.text}")
             return {"code": -1, "message": "API Error (Non-JSON)", "raw": resp.text}
             
     except Exception as e:
-        log(f"Crash Exception: {str(e)}")
-        # 捕获所有 Python 异常，返回 400，防止 500 Internal Server Error
-        raise HTTPException(status_code=400, detail=f"Backend Logic Error: {str(e)}")
+        log(f"Crash: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/api/check_status")
 def check_status(req: StatusRequest):
@@ -123,9 +128,20 @@ def check_status(req: StatusRequest):
     path = "/"
     query = {"Action": "CVProcess", "Version": "2022-08-31"}
     body_obj = {"req_key": "video_generation", "task_id": req.task_id}
-    body_str = json.dumps(body_obj)
+    
+    # 同样的处理逻辑
+    body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     headers = {"content-type": "application/json"}
     
     try:
-        signed_headers_dict = sign_request("POST", path, query, headers, body_str, req.access_key, req.secret_key)
-        url = f"https://{host}{path}?Action
+        signed_headers_dict = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
+        url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
+        resp = requests.post(url, headers=signed_headers_dict, data=body_bytes)
+        return resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
