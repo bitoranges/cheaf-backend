@@ -6,11 +6,10 @@ import datetime
 import requests
 import json
 import os
-import logging
 
-# 配置日志打印
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("cheaf-backend")
+# 使用标准 print 输出日志，最稳妥
+def log(msg):
+    print(f"[Cheaf-Log] {msg}", flush=True)
 
 app = FastAPI()
 
@@ -35,7 +34,7 @@ class StatusRequest(BaseModel):
     secret_key: str
 
 def sign_request(method, path, query, headers, body, ak, sk):
-    # 移除微秒，只保留整数秒，避免格式差异
+    # 移除微秒
     now = datetime.datetime.utcnow().replace(microsecond=0)
     iso_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_short = now.strftime("%Y%m%d")
@@ -58,15 +57,11 @@ def sign_request(method, path, query, headers, body, ak, sk):
     def get_hmac(key, msg):
         return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
     
-    try:
-        k_date = get_hmac(sk.encode('utf-8'), date_short)
-        k_region = get_hmac(k_date, "cn-north-1")
-        k_service = get_hmac(k_region, "cv")
-        k_signing = get_hmac(k_service, "request")
-        signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
-    except Exception as e:
-        logger.error(f"Signing failed: {str(e)}")
-        raise e
+    k_date = get_hmac(sk.encode('utf-8'), date_short)
+    k_region = get_hmac(k_date, "cn-north-1")
+    k_service = get_hmac(k_region, "cv")
+    k_signing = get_hmac(k_service, "request")
+    signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
     
     auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={signedHeaders}, Signature={signature}"
     headers["Authorization"] = auth
@@ -74,17 +69,17 @@ def sign_request(method, path, query, headers, body, ak, sk):
 
 @app.get("/")
 def read_root():
+    log("Health check ping received")
     return {"status": "Cheaf Backend is running"}
 
 @app.post("/api/generate_video")
 def generate_video(req: VideoRequest):
-    logger.info("Received generate_video request")
+    log(f"Received generation request for prompt: {req.prompt[:20]}...")
     
     host = "visual.volcengineapi.com"
     path = "/"
     query = {"Action": "CVProcess", "Version": "2022-08-31"}
     
-    # 这里的 req_key 是关键，即梦(PixelDance) 可能需要 'video_generation' 或 'high_quality_video_generation'
     body_obj = {
         "req_key": "video_generation",
         "prompt": req.prompt,
@@ -95,25 +90,26 @@ def generate_video(req: VideoRequest):
     headers = {"content-type": "application/json"}
     
     try:
+        log("Signing request...")
         signed_headers = sign_request("POST", path, query, headers, body_str, req.access_key, req.secret_key)
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
         
-        logger.info(f"Forwarding to Volcengine: {url}")
+        log(f"Sending to Volcengine: {url}")
         resp = requests.post(url, headers=signed_headers, data=body_str)
         
-        logger.info(f"Volcengine Response Status: {resp.status_code}")
+        log(f"Volcengine HTTP Status: {resp.status_code}")
         
-        # 尝试解析 JSON，如果失败则返回原文
+        # 即使报错，也尝试返回原文，而不是直接抛出 500
         try:
             return resp.json()
         except:
-            logger.error(f"Failed to parse JSON. Raw response: {resp.text}")
-            return {"code": -1, "message": "Volcengine returned non-JSON", "raw": resp.text}
+            log(f"Non-JSON response: {resp.text}")
+            return {"code": -1, "message": "Volcengine Error (Non-JSON)", "raw": resp.text}
             
     except Exception as e:
-        logger.error(f"Internal Error: {str(e)}")
-        # 返回 400 而不是 500，这样前端能拿到错误信息
-        raise HTTPException(status_code=400, detail=f"Backend Error: {str(e)}")
+        log(f"Internal Exception: {str(e)}")
+        # 捕获所有错误，返回 400 给前端，而不是 500
+        raise HTTPException(status_code=400, detail=f"Backend Exception: {str(e)}")
 
 @app.post("/api/check_status")
 def check_status(req: StatusRequest):
@@ -131,7 +127,7 @@ def check_status(req: StatusRequest):
         try:
             return resp.json()
         except:
-             return {"code": -1, "message": "Volcengine returned non-JSON", "raw": resp.text}
+            return {"code": -1, "message": "Non-JSON response", "raw": resp.text}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
