@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# 日志工具
 def log(msg):
     print(f"[Cheaf] {msg}", file=sys.stdout, flush=True)
 
@@ -34,27 +35,29 @@ class StatusRequest(BaseModel):
     secret_key: str
 
 def sign_request(method, path, query, headers, body_bytes, ak, sk):
-    # body_bytes 必须是 bytes 类型，确保签名对象和发送对象完全一致
+    # 1. 准备时间
     now = datetime.datetime.utcnow().replace(microsecond=0)
     iso_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_short = now.strftime("%Y%m%d")
     
+    # 2. 补充必要 Header
     headers["x-date"] = iso_date
     headers["host"] = "visual.volcengineapi.com"
     
+    # 3. 规范化
     canonical_uri = path
     canonical_query = "&".join([f"{k}={v}" for k, v in sorted(query.items())])
     
-    # 排序 Header
     sorted_headers = sorted(headers.items())
     canonical_headers = "".join([f"{k.lower()}:{v.strip()}\n" for k, v in sorted_headers])
     signed_headers = ";".join([k.lower() for k, v in sorted_headers])
     
-    # 计算 Payload Hash (直接对二进制数据哈希)
+    # 4. 计算 Body 哈希 (对原始二进制进行哈希)
     payload_hash = hashlib.sha256(body_bytes).hexdigest()
     
     canonical_request = f"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     
+    # 5. 签名计算
     credential_scope = f"{date_short}/cn-north-1/cv/request"
     string_to_sign = f"HMAC-SHA256\n{iso_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
     
@@ -78,7 +81,7 @@ def read_root():
 
 @app.post("/api/generate_video")
 def generate_video(req: VideoRequest):
-    log(f"New Task Prompt: {req.prompt[:20]}...")
+    log(f"New Task: {req.prompt[:20]}...")
     
     host = "visual.volcengineapi.com"
     path = "/"
@@ -91,32 +94,31 @@ def generate_video(req: VideoRequest):
         "model_version": "general_v3"
     }
     
-    # 关键修正：
-    # 1. ensure_ascii=False: 允许输出真实中文，不转义为 \uXXXX
-    # 2. separators=(',', ':'): 去除空格，紧凑格式，防止哈希不一致
-    # 3. .encode('utf-8'): 转为二进制 bytes，确保 requests 发送的和我们签名的是同一串字节
-    body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    # 关键修改：使用默认的 json.dumps
+    # 这样中文会被转义为 \uXXXX (纯 ASCII)，这是最安全的签名方式，避免编码不一致
+    body_str = json.dumps(body_obj)
+    body_bytes = body_str.encode('utf-8')
     
     headers = {"content-type": "application/json"}
     
     try:
         log("Signing request...")
-        signed_headers_dict = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
+        signed_headers = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
+        
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
-        
         log("Sending to Volcengine...")
-        # 注意这里用 data=body_bytes
-        resp = requests.post(url, headers=signed_headers_dict, data=body_bytes)
         
-        log(f"Volcengine Response: {resp.status_code}")
+        # 必须使用 data=body_bytes，确保发送的内容和签名的内容比特级一致
+        resp = requests.post(url, headers=signed_headers, data=body_bytes)
         
+        log(f"Volcengine Status: {resp.status_code}")
         if resp.status_code != 200:
-             log(f"Error Body: {resp.text}")
-
+            log(f"Error Body: {resp.text}")
+            
         try:
             return resp.json()
         except:
-            return {"code": -1, "message": "API Error (Non-JSON)", "raw": resp.text}
+            return {"code": -1, "message": "Non-JSON response", "raw": resp.text}
             
     except Exception as e:
         log(f"Crash: {str(e)}")
@@ -129,14 +131,15 @@ def check_status(req: StatusRequest):
     query = {"Action": "CVProcess", "Version": "2022-08-31"}
     body_obj = {"req_key": "video_generation", "task_id": req.task_id}
     
-    # 同样的处理逻辑
-    body_bytes = json.dumps(body_obj, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    # 同样的 ASCII 安全处理
+    body_str = json.dumps(body_obj)
+    body_bytes = body_str.encode('utf-8')
     headers = {"content-type": "application/json"}
     
     try:
-        signed_headers_dict = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
+        signed_headers = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
-        resp = requests.post(url, headers=signed_headers_dict, data=body_bytes)
+        resp = requests.post(url, headers=signed_headers, data=body_bytes)
         return resp.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
