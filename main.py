@@ -128,14 +128,4 @@ def check_status(req: StatusRequest):
     
     try:
         signed_headers_dict = sign_request("POST", path, query, headers, body_str, req.access_key, req.secret_key)
-        url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
-        resp = requests.post(url, headers=signed_headers_dict, data=body_str)
-        return resp.json()
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    # 3. 适配 Zeabur 端口
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        url = f"https://{host}{path}?Action
