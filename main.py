@@ -6,10 +6,14 @@ import datetime
 import requests
 import json
 import os
+import logging
+
+# 配置日志打印
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("cheaf-backend")
 
 app = FastAPI()
 
-# 允许跨域请求 (CORS)
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
@@ -30,9 +34,9 @@ class StatusRequest(BaseModel):
     access_key: str
     secret_key: str
 
-# --- 签名算法 ---
 def sign_request(method, path, query, headers, body, ak, sk):
-    now = datetime.datetime.utcnow()
+    # 移除微秒，只保留整数秒，避免格式差异
+    now = datetime.datetime.utcnow().replace(microsecond=0)
     iso_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_short = now.strftime("%Y%m%d")
     
@@ -54,11 +58,15 @@ def sign_request(method, path, query, headers, body, ak, sk):
     def get_hmac(key, msg):
         return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
     
-    k_date = get_hmac(sk.encode('utf-8'), date_short)
-    k_region = get_hmac(k_date, "cn-north-1")
-    k_service = get_hmac(k_region, "cv")
-    k_signing = get_hmac(k_service, "request")
-    signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    try:
+        k_date = get_hmac(sk.encode('utf-8'), date_short)
+        k_region = get_hmac(k_date, "cn-north-1")
+        k_service = get_hmac(k_region, "cv")
+        k_signing = get_hmac(k_service, "request")
+        signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    except Exception as e:
+        logger.error(f"Signing failed: {str(e)}")
+        raise e
     
     auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={signedHeaders}, Signature={signature}"
     headers["Authorization"] = auth
@@ -70,9 +78,13 @@ def read_root():
 
 @app.post("/api/generate_video")
 def generate_video(req: VideoRequest):
+    logger.info("Received generate_video request")
+    
     host = "visual.volcengineapi.com"
     path = "/"
     query = {"Action": "CVProcess", "Version": "2022-08-31"}
+    
+    # 这里的 req_key 是关键，即梦(PixelDance) 可能需要 'video_generation' 或 'high_quality_video_generation'
     body_obj = {
         "req_key": "video_generation",
         "prompt": req.prompt,
@@ -85,10 +97,23 @@ def generate_video(req: VideoRequest):
     try:
         signed_headers = sign_request("POST", path, query, headers, body_str, req.access_key, req.secret_key)
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
+        
+        logger.info(f"Forwarding to Volcengine: {url}")
         resp = requests.post(url, headers=signed_headers, data=body_str)
-        return resp.json()
+        
+        logger.info(f"Volcengine Response Status: {resp.status_code}")
+        
+        # 尝试解析 JSON，如果失败则返回原文
+        try:
+            return resp.json()
+        except:
+            logger.error(f"Failed to parse JSON. Raw response: {resp.text}")
+            return {"code": -1, "message": "Volcengine returned non-JSON", "raw": resp.text}
+            
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Internal Error: {str(e)}")
+        # 返回 400 而不是 500，这样前端能拿到错误信息
+        raise HTTPException(status_code=400, detail=f"Backend Error: {str(e)}")
 
 @app.post("/api/check_status")
 def check_status(req: StatusRequest):
@@ -103,13 +128,14 @@ def check_status(req: StatusRequest):
         signed_headers = sign_request("POST", path, query, headers, body_str, req.access_key, req.secret_key)
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
         resp = requests.post(url, headers=signed_headers, data=body_str)
-        return resp.json()
+        try:
+            return resp.json()
+        except:
+             return {"code": -1, "message": "Volcengine returned non-JSON", "raw": resp.text}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=400, detail=str(e))
 
-# --- 关键修复：监听 0.0.0.0 以解决 502 错误 ---
 if __name__ == "__main__":
     import uvicorn
-    # 获取 Zeabur 提供的端口，如果没有则默认 8000
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
