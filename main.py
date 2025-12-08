@@ -9,12 +9,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# 日志工具
+# 1. 强制日志输出到控制台
 def log(msg):
     print(f"[Cheaf] {msg}", file=sys.stdout, flush=True)
 
 app = FastAPI()
 
+# 2. 允许跨域
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -35,29 +36,29 @@ class StatusRequest(BaseModel):
     secret_key: str
 
 def sign_request(method, path, query, headers, body_bytes, ak, sk):
-    # 1. 准备时间
+    # 移除微秒
     now = datetime.datetime.utcnow().replace(microsecond=0)
     iso_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_short = now.strftime("%Y%m%d")
     
-    # 2. 补充必要 Header
     headers["x-date"] = iso_date
     headers["host"] = "visual.volcengineapi.com"
     
-    # 3. 规范化
+    # 规范化
     canonical_uri = path
     canonical_query = "&".join([f"{k}={v}" for k, v in sorted(query.items())])
     
     sorted_headers = sorted(headers.items())
     canonical_headers = "".join([f"{k.lower()}:{v.strip()}\n" for k, v in sorted_headers])
+    
+    # 修复变量名：使用 signed_headers (下划线)
     signed_headers = ";".join([k.lower() for k, v in sorted_headers])
     
-    # 4. 计算 Body 哈希 (对原始二进制进行哈希)
+    # 计算 Body 哈希 (对二进制数据哈希)
     payload_hash = hashlib.sha256(body_bytes).hexdigest()
     
     canonical_request = f"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
     
-    # 5. 签名计算
     credential_scope = f"{date_short}/cn-north-1/cv/request"
     string_to_sign = f"HMAC-SHA256\n{iso_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
     
@@ -70,6 +71,7 @@ def sign_request(method, path, query, headers, body_bytes, ak, sk):
     k_signing = get_hmac(k_service, "request")
     signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
     
+    # 修复引用：使用 signed_headers
     auth = f"HMAC-SHA256 Credential={ak}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
     headers["Authorization"] = auth
     return headers
@@ -94,8 +96,8 @@ def generate_video(req: VideoRequest):
         "model_version": "general_v3"
     }
     
-    # 关键修改：使用默认的 json.dumps
-    # 这样中文会被转义为 \uXXXX (纯 ASCII)，这是最安全的签名方式，避免编码不一致
+    # 【核心修复】：使用默认 json.dumps (ensure_ascii=True)
+    # 这会将中文转为 \uXXXX 的纯 ASCII 格式，这是最稳妥的签名方式
     body_str = json.dumps(body_obj)
     body_bytes = body_str.encode('utf-8')
     
@@ -103,15 +105,17 @@ def generate_video(req: VideoRequest):
     
     try:
         log("Signing request...")
-        signed_headers = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
+        # 传入 bytes 计算签名
+        signed_headers_dict = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
         
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
         log("Sending to Volcengine...")
         
-        # 必须使用 data=body_bytes，确保发送的内容和签名的内容比特级一致
-        resp = requests.post(url, headers=signed_headers, data=body_bytes)
+        # 传入 bytes 发送请求，确保比特级一致
+        resp = requests.post(url, headers=signed_headers_dict, data=body_bytes)
         
         log(f"Volcengine Status: {resp.status_code}")
+        
         if resp.status_code != 200:
             log(f"Error Body: {resp.text}")
             
@@ -131,20 +135,21 @@ def check_status(req: StatusRequest):
     query = {"Action": "CVProcess", "Version": "2022-08-31"}
     body_obj = {"req_key": "video_generation", "task_id": req.task_id}
     
-    # 同样的 ASCII 安全处理
+    # 同样的处理：转为 bytes
     body_str = json.dumps(body_obj)
     body_bytes = body_str.encode('utf-8')
     headers = {"content-type": "application/json"}
     
     try:
-        signed_headers = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
+        signed_headers_dict = sign_request("POST", path, query, headers, body_bytes, req.access_key, req.secret_key)
         url = f"https://{host}{path}?Action=CVProcess&Version=2022-08-31"
-        resp = requests.post(url, headers=signed_headers, data=body_bytes)
+        resp = requests.post(url, headers=signed_headers_dict, data=body_bytes)
         return resp.json()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
+    # 3. 适配 Zeabur 端口
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
